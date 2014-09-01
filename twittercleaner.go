@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/zip"
+	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"log"
@@ -21,6 +23,90 @@ type Configuration struct {
 	MaxAge      int
 }
 
+func blindDeleter(config Configuration, c <-chan int64) {
+	// Connect to Twitter
+	anaconda.SetConsumerKey(config.Key)
+	anaconda.SetConsumerSecret(config.Secret)
+	api := anaconda.NewTwitterApi(config.Token, config.TokenSecret)
+	for tweetid := range c {
+		_, err := api.DeleteTweet(tweetid, true)
+		if err != nil {
+			log.Println(err)
+		}
+	}
+}
+
+func deleteOldTweetsFromTimeline(config Configuration, c chan int64) {
+	// Connect to Twitter
+	anaconda.SetConsumerKey(config.Key)
+	anaconda.SetConsumerSecret(config.Secret)
+	api := anaconda.NewTwitterApi(config.Token, config.TokenSecret)
+	v := url.Values{}
+	v.Set("count", "200")
+	lasttweet := int64(math.MaxInt64)
+	for {
+		timeline, err := api.GetUserTimeline(v)
+		if len(timeline) == 0 {
+			break
+		}
+		if err != nil {
+			log.Println(err)
+			break
+		}
+		for _, tweet := range timeline {
+			if tweet.Id < lasttweet {
+				lasttweet = tweet.Id
+			}
+
+			v.Set("max_id", strconv.FormatInt(lasttweet-1, 10))
+			ts, err := time.Parse("Mon Jan _2 15:04:05 -0700 2006", tweet.CreatedAt)
+			if err != nil {
+				log.Println(err)
+			}
+			if ts.Before(time.Now().Add(-time.Duration(config.MaxAge) * time.Hour)) {
+				c <- tweet.Id
+			}
+		}
+	}
+
+}
+
+func deleteOldTweetsFromArchive(config Configuration, arch string) {
+	// Connect to Twitter
+	anaconda.SetConsumerKey(config.Key)
+	anaconda.SetConsumerSecret(config.Secret)
+	api := anaconda.NewTwitterApi(config.Token, config.TokenSecret)
+	r, err := zip.OpenReader(arch)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer r.Close()
+	for _, f := range r.File {
+		if f.Name == "tweets.csv" {
+			datafile, err := f.Open()
+			if err != nil {
+				log.Fatal(err)
+			}
+			reader := csv.NewReader(datafile)
+			records, err := reader.ReadAll()
+			if err != nil {
+				log.Fatal(err)
+			}
+			for _, record := range records[1:] {
+				id, err := strconv.ParseInt(record[0], 10, 64)
+				if err != nil {
+					log.Println(err)
+				}
+				_, err = api.DeleteTweet(id, true)
+				if err != nil {
+					log.Println(err)
+				}
+			}
+
+		}
+	}
+}
+
 func main() {
 
 	// Parse commandline flags
@@ -29,6 +115,7 @@ func main() {
 	consumerSecret := flag.String("consumersecret", "", "Twitter Consumer Secret")
 	twitterAccesToken := flag.String("accestoken", "", "Twitter Access Token")
 	twitterAccesTokenSecret := flag.String("accesstokensecret", "", "Twitter Access Token Secret")
+	twitterArchive := flag.String("archive", "", "Delete from twitter archive")
 	maxAge := flag.Int("maxage", 48, "Maximum age of tweets (hours)")
 	writeConfig := flag.Bool("writeconfig", false, "Write flags to configuration file")
 	flag.Parse()
@@ -83,40 +170,14 @@ func main() {
 
 	}
 
-	// Connect to Twitter
-	anaconda.SetConsumerKey(config.Key)
-	anaconda.SetConsumerSecret(config.Secret)
-	api := anaconda.NewTwitterApi(config.Token, config.TokenSecret)
-
-	for c := time.Tick(1 * time.Hour); ; <-c { // Clean once an hour
-		v := url.Values{}
-		v.Set("count", "200")
-		lasttweet := int64(math.MaxInt64)
-		for {
-			timeline, err := api.GetUserTimeline(v)
-			if len(timeline) == 0 {
-				break
-			}
-			if err != nil {
-				log.Fatal(err)
-			}
-			for _, tweet := range timeline {
-				if tweet.Id < lasttweet {
-					lasttweet = tweet.Id
-				}
-
-				v.Set("max_id", strconv.FormatInt(lasttweet-1, 10))
-				ts, err := time.Parse("Mon Jan _2 15:04:05 -0700 2006", tweet.CreatedAt)
-				if err != nil {
-					log.Fatal(err)
-				}
-				if ts.Before(time.Now().Add(-time.Duration(config.MaxAge) * time.Hour)) {
-					_, err = api.DeleteTweet(tweet.Id, true)
-					if err != nil {
-						log.Fatal(err)
-					}
-				}
-			}
+	if *twitterArchive != "" {
+		// Delete tweets from archive
+		deleteOldTweetsFromArchive(config, *twitterArchive)
+	} else {
+		for c := time.Tick(1 * time.Hour); ; <-c { // Clean once an hour
+			deletechan := make(chan int64)
+			go blindDeleter(config, deletechan)
+			go deleteOldTweetsFromTimeline(config, deletechan)
 		}
 	}
 }
